@@ -1,0 +1,2 @@
+# 8004 NONCE Colony bot uses the Python standard library only — no packages required.
+# (Kept for clarity; the GitHub Action runs plain `python bot.py`.)
