@@ -6,11 +6,12 @@ Standard library only — no pip install required.
 Each LIVE run, in order:
   0) reply to NEW comments on DAEMON's own posts (armed with the 8004 NONCE facts in persona.md),
   1) post the next curated debut piece (one/day cap), then
-  2) engage relevant feed threads (a comment, or a 'finding').
+  2) if no post in MUSE_AFTER_DAYS days, post a fresh self-generated musing,
+     else engage relevant feed threads (a comment, or a 'finding').
 DRY_RUN ("true", the default) logs the debut and writes NOTHING.
 
 Env: COLONY_API_KEY, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, DRY_RUN,
-     MAX_POSTS_PER_DAY (1), MAX_COMMENTS_PER_DAY (3), MAX_REPLIES_PER_RUN (3),
+     MAX_POSTS_PER_DAY (1), MAX_COMMENTS_PER_DAY (3), MAX_REPLIES_PER_RUN (3), MUSE_AFTER_DAYS (3),
      COLONY_USERNAME (nonce_daemon)
 """
 
@@ -35,6 +36,8 @@ LLM_MODEL = (os.environ.get("LLM_MODEL") or "mistral-small-latest").strip()
 MAX_POSTS = int(os.environ.get("MAX_POSTS_PER_DAY", "1"))
 MAX_COMMENTS = int(os.environ.get("MAX_COMMENTS_PER_DAY", "3"))
 MAX_REPLIES = int(os.environ.get("MAX_REPLIES_PER_RUN", "3"))
+MUSE_AFTER_DAYS = int(os.environ.get("MUSE_AFTER_DAYS", "3"))   # post a fresh musing after this many quiet days
+POST_TAGS = ["8004 nonce", "proof-of-work", "on-chain"]
 
 TOPIC_FENCE = ["8004", "nonce", "on-chain", "onchain", "generative", "art", "provenance",
                "verify", "verification", "proof-of-work", "proof of work", "pow", "mining",
@@ -73,7 +76,8 @@ def load_state():
             return json.load(f)
     except Exception:
         return {"date": "", "posts_today": 0, "comments_today": 0, "seed_index": 0,
-                "acted_ids": [], "cursor": "", "my_posts": [], "replied_ids": []}
+                "acted_ids": [], "cursor": "", "my_posts": [], "replied_ids": [],
+                "last_post_date": "", "recent_titles": []}
 
 
 def save_state(s):
@@ -271,6 +275,34 @@ def reply_to_comments(jwt, s, persona):
     log(f"replies this run: {made}")
 
 
+def days_since(date_str):
+    if not date_str:
+        return 9999
+    try:
+        return (datetime.date.today() - datetime.date.fromisoformat(date_str)).days
+    except Exception:
+        return 9999
+
+
+def record_post(s, title):
+    s["last_post_date"] = today()
+    rt = (s.get("recent_titles") or [])
+    rt.append(title)
+    s["recent_titles"] = rt[-20:]
+
+
+def draft_musing(persona, recent_titles):
+    avoid = " | ".join((recent_titles or [])[-10:]) or "(nothing yet)"
+    user = ("Write ONE fresh, standalone Colony post in your own voice - a short observation, finding, or "
+            "provocation about your own work and why it can be verified, not trusted. "
+            f"Do NOT repeat the themes or titles of your recent posts: {avoid}. "
+            "Stay strictly on your own subject matter. NEVER invent facts, numbers, addresses, or counts you "
+            "were not given in your persona. Sometimes (not always) close on the motto 'trust nothing; verify everything'. "
+            "Keep it tight - under 130 words, lowercase, no emoji. "
+            'Return ONLY JSON: {"title":"<= 80 chars","body":"<markdown>"}')
+    return extract_json(llm_chat(persona, user, max_tokens=420, temp=0.85))
+
+
 # ---------- main ----------
 def main():
     persona = open(PERSONA_FILE).read() if os.path.exists(PERSONA_FILE) else "You are DAEMON."
@@ -281,6 +313,8 @@ def main():
     if not s.get("my_posts"):
         s["my_posts"] = list(KNOWN_POSTS)
     s.setdefault("replied_ids", [])
+    s.setdefault("last_post_date", "")
+    s.setdefault("recent_titles", [])
 
     log(f"DRY_RUN={DRY_RUN}  model={LLM_MODEL}  base={LLM_BASE_URL}")
     log(f"seed_index={s['seed_index']}/{len(seeds)}  posts_today={s['posts_today']}  my_posts={len(s['my_posts'])}  replied={len(s['replied_ids'])}")
@@ -322,10 +356,40 @@ def main():
                 s["my_posts"].append(pid)
             s["seed_index"] += 1
             s["posts_today"] += 1
+            record_post(s, seed["title"])
         else:
             log("seed post failed:", st, resp)
         save_state(s)
         return
+
+    # --- phase A2: self-sustaining musing once the debut seeds are spent ---
+    if (s["seed_index"] >= len(seeds) and s["posts_today"] < MAX_POSTS
+            and days_since(s.get("last_post_date")) >= MUSE_AFTER_DAYS):
+        if not LLM_API_KEY:
+            log("musing due, but no LLM key; skipping to feed.")
+        else:
+            m = draft_musing(persona, s.get("recent_titles"))
+            title = (m.get("title") or "").strip()
+            body = (m.get("body") or "").strip()
+            if title and body:
+                log(f"PLAN musing ({days_since(s.get('last_post_date'))}d quiet): {title}")
+                if DRY_RUN:
+                    log(f"\n===== MUSING [general] (discussion)  {title} =====\n{body}\n")
+                    return
+                st, resp = create_post(jwt, "general", "discussion", title, body, {"tags": POST_TAGS})
+                if st in (200, 201):
+                    pid = resp.get("id") if isinstance(resp, dict) else None
+                    if pid:
+                        s["my_posts"].append(pid)
+                    s["posts_today"] += 1
+                    record_post(s, title)
+                    log("musing posted:", pid or "ok")
+                else:
+                    log("musing post failed:", st, resp)
+                save_state(s)
+                return
+            else:
+                log("musing: llm returned nothing usable; falling through.")
 
     # --- phase B: engage the feed ---
     posts = recent_posts(20)
@@ -372,6 +436,7 @@ def main():
                 if pid:
                     s["my_posts"].append(pid)
                 s["posts_today"] += 1
+                record_post(s, title)
             else:
                 log("post failed:", st, resp)
     else:
