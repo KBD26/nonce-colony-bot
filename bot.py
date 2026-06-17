@@ -15,7 +15,7 @@ Env: COLONY_API_KEY, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, DRY_RUN,
      COLONY_USERNAME (nonce_daemon)
 """
 
-import json, os, re, sys, datetime, urllib.request, urllib.error
+import json, os, re, sys, random, datetime, urllib.request, urllib.error
 
 COLONY = "https://thecolony.cc/api/v1"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +37,7 @@ MAX_POSTS = int(os.environ.get("MAX_POSTS_PER_DAY", "1"))
 MAX_COMMENTS = int(os.environ.get("MAX_COMMENTS_PER_DAY", "3"))
 MAX_REPLIES = int(os.environ.get("MAX_REPLIES_PER_RUN", "3"))
 MUSE_AFTER_DAYS = int(os.environ.get("MUSE_AFTER_DAYS", "3"))   # post a fresh musing after this many quiet days
+ASK_ART_PROB = float(os.environ.get("ASK_ART_PROB", "0.3"))   # chance per feed-engage run to steer toward an art-ownership question
 POST_TAGS = ["8004 nonce", "proof-of-work", "on-chain"]
 
 TOPIC_FENCE = ["8004", "nonce", "on-chain", "onchain", "generative", "art", "provenance",
@@ -408,10 +409,14 @@ def main():
         f"- id={p.get('id')} | {p.get('title')} :: {(p.get('body') or '')[:160]}"
         for p in candidates[:10])
     caps = f"posts_left={MAX_POSTS - s['posts_today']} comments_left={MAX_COMMENTS - s['comments_today']}"
+    ask_mode = random.random() < ASK_ART_PROB
+    log(f"ask_mode={ask_mode}")
     user = (f"Recent relevant Colony posts:\n{feed_str}\n\nYour caps today: {caps}.\n"
             "Pick ONE action. Prefer a substantive comment on the single most relevant post; post a new 'finding' "
             "only if you have something concrete and new to add. If nothing is genuinely relevant, action 'none'. "
             'Return ONLY JSON: {"action":"comment"|"post"|"none","target_id":"<post id or null>","title":"<title or null>","body":"<markdown or null>"}')
+    if ask_mode:
+        user = ("THIS ROUND, be curious about ownership: if a listed post is by another agent, prefer a COMMENT that genuinely asks whether they own any art (owned, on-chain, theirs) and why or why not; if they have a collection, ask about it and whether it verifies on-chain. peer curiosity, not a pitch; do not promote your own work. " + user)
     decision = extract_json(llm_chat(persona, user, max_tokens=400, temp=0.7))
     log("LLM decision:", json.dumps(decision))
     act = (decision.get("action") or "none").lower()
